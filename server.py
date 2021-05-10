@@ -22,7 +22,7 @@ import threading
 import random
 
 # countdown time in seconds before a game starts
-countdown = 3
+countdown = 0
 
 
 
@@ -37,10 +37,11 @@ players_eliminated = []
 
 live_idnums = []
 
+
 # send a message to all clients connected to the server
 def send_to_all(msg):
-     for key in players:
-         key.send(msg)
+    for key in players:
+        key.send(msg)
 
 # send a message to all clients except specified client
 def send_to_others(msg, current_con):
@@ -64,7 +65,7 @@ def disconnect_player(connection, id):
         players.pop(connection, None)
 
 # check to see if the game should finish, and if a new game should start
-def check_game_over():
+def check_game_over(id):
     global in_progress
 
     if len(players_remaining) == 1 and len(players) >= 2:
@@ -91,7 +92,9 @@ def client_spec(lock, connection, address, players):
 
     live_idnums = []
 
-    # let the other clients know of this clients connection
+    global in_progress
+
+    # let this client know of the other clients already connected
     for key in players:
         live_idnums.append(players[key].id)
         other_host, other_port = players[key].address
@@ -108,7 +111,7 @@ def client_spec(lock, connection, address, players):
         i += 1
 
     #Notify client of actual current turn
-    if len(turn_order) > 0:
+    if len(turn_order) > 0 and in_progress:
         connection.send(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
 
 
@@ -126,9 +129,9 @@ def client_spec(lock, connection, address, players):
 
     global players_eliminated
     # notify client of the players who've been eliminated from the current game
-    for id in players_eliminated:
-        connection.send(tiles.MessagePlayerEliminated(id).pack())
-
+    if in_progress:
+        for id in players_eliminated:
+            connection.send(tiles.MessagePlayerEliminated(id).pack())
 
     while True:
       chunk = connection.recv(4096)
@@ -140,10 +143,13 @@ def client_spec(lock, connection, address, players):
             disconnect_player(connection, idnum)
         return
 
-      # kill this thread if the client is in a game
-      for item in turn_order:
-          if item == idnum:
-              return
+      while True:
+          # kill this thread if the client is in a game
+          if in_progress:
+              for item in turn_order:
+                  if item == idnum:
+                      print('closing spectator thread for id: ', idnum)
+                      return
 
 
 
@@ -196,23 +202,29 @@ def client_handler(lock, connection, address, players):
       # handle client disconnection
       print('client {} disconnected'.format(address))
 
+
       # increment turns if it was that players turn
       if len(players) > 1:
           if turn_order[turn_index] == idnum:
               with lock:
-                  turn_index = (turn_index + 1) % (len(turn_order) - 1)
-              send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
+                  send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index+1]).pack(), connection)
+                  turn_order.remove(idnum)
+          else:
+              if idnum in turn_order:
+                  with lock:
+                      turn_order.remove(idnum)
+
 
       # run the disconnect client function
       with lock:
           disconnect_player(connection, idnum)
 
-      # let other clients know the client has been eliminated, add to players eliminated
-      send_to_others(tiles.MessagePlayerEliminated(idnum).pack(), connection)
-      players_eliminated.append(idnum)
+          # let other clients know the client has been eliminated, add to players eliminated
+          send_to_others(tiles.MessagePlayerEliminated(idnum).pack(), connection)
+          players_eliminated.append(idnum)
 
       # check if client disconnection should cause came to finish
-      check_game_over()
+      check_game_over(idnum)
       return
 
     buffer.extend(chunk)
@@ -259,8 +271,13 @@ def client_handler(lock, connection, address, players):
                 players_remaining.remove(idnum)
             players_eliminated.append(idnum)
 
+            with lock:
+                turn_order.remove(idnum)
+
+            send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
+
             # check to see if client eliminated should cause game to finish
-            check_game_over()
+            check_game_over(idnum)
             return
 
           # pickup a new tile and remove placed tile from hand
@@ -271,7 +288,8 @@ def client_handler(lock, connection, address, players):
 
           # start next turn, increment the turn index and send next turn to all clients
           with lock:
-              turn_index = (turn_index + 1) % len(turn_order)
+              turn_order.remove(idnum)
+              turn_order.append(idnum)
           send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
 
       # sent by the player in the second turn, to choose their token's
@@ -299,13 +317,20 @@ def client_handler(lock, connection, address, players):
                   players_remaining.remove(idnum)
               players_eliminated.append(idnum)
 
+              with lock:
+                  turn_order.remove(idnum)
+
+              send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
+
               # check if this player being eliminated should cause the game to finish
-              check_game_over()
+              check_game_over(idnum)
               return
 
             # start next turn, increment the turn index and send next turn to all clients
             with lock:
-                turn_index = (turn_index + 1) % len(turn_order)
+                #turn_index = (turn_index + 1) % len(turn_order)
+                turn_order.remove(idnum)
+                turn_order.append(idnum)
             send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
 
 
@@ -398,12 +423,11 @@ def start_game():
         threading.Event().wait(1)
 
     print('starting game...')
+    print(turn_order)
 
     # start a thread to handle each client in game
     for i in range(len(players)):
       threading.Thread(target=client_handler, args=(lock, list(players)[i], players[list(players)[i]].address, players,), daemon=True).start()
-
-
 
 
 
@@ -418,8 +442,9 @@ while True:
 
   lock = threading.RLock()
 
+
   # start thread for the client to spectate
-  threading.Thread(target=client_spec, args=(lock, connection, client_address, players)).start()
+  threading.Thread(target=client_spec, args=(lock, connection, client_address, players), daemon=True).start()
 
   playerno += 1
 
