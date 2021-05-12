@@ -35,7 +35,10 @@ placements = []
 current_tokens = []
 players_eliminated = []
 
-live_idnums = []
+players = {}
+players_remaining = []
+
+playerno = 0
 
 
 # send a message to all clients connected to the server
@@ -62,10 +65,10 @@ def disconnect_player(connection, id):
         if id in turn_order:
             turn_order.remove(id)
 
-        players.pop(connection, None)
+        del players[connection]
 
 # check to see if the game should finish, and if a new game should start
-def check_game_over(id):
+def check_game_over(con):
     global in_progress
 
     if len(players_remaining) == 1 and len(players) >= 2:
@@ -75,124 +78,25 @@ def check_game_over(id):
         turn_order.clear()
         placements.clear()
         start_game()
+        return True
 
-    elif len(players_remaining) <= 1:
+    elif len(players_remaining) == 1:
         print('Game over')
         turn_order.clear()
         placements.clear()
         in_progress = False
+        return True
+
+    return False
 
 
 
-def client_spec(lock, connection, address, players):
-    host, port = address
-    name = '{}:{}'.format(host, port)
 
-    idnum = players[connection].id
-
-    live_idnums = []
-
-    global in_progress
-
-    # let this client know of the other clients already connected
-    for key in players:
-        live_idnums.append(players[key].id)
-        other_host, other_port = players[key].address
-        other_name = '{}:{}'.format(other_host, other_port)
-        connection.send(tiles.MessagePlayerJoined(other_name, players[key].id).pack())
-
-    # welcome the client to the server
-    connection.send(tiles.MessageWelcome(idnum).pack())
-    send_to_others(tiles.MessagePlayerJoined(name, idnum).pack(), connection)
-
-    i = 0
-    for id in live_idnums:
-        connection.send(tiles.MessagePlayerTurn(players[list(players)[i]].id).pack())
-        i += 1
-
-    #Notify client of actual current turn
-    if len(turn_order) > 0 and in_progress:
-        connection.send(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
-
-
-    global placements
-    # notify client of the board of the current game
-    for t in range(len(placements)):
-        place = tiles.MessagePlaceTile(placements[t][0], placements[t][1], placements[t][2], placements[t][3], placements[t][4])
-        connection.send(place.pack())
-
-    global current_tokens
-    # notify client of the token movements of the current game
-    for a in range(len(current_tokens)):
-        tok = tiles.MessageMoveToken(current_tokens[a][0], current_tokens[a][1],current_tokens[a][2],current_tokens[a][3])
-        connection.send(tok.pack())
-
-    global players_eliminated
-    # notify client of the players who've been eliminated from the current game
-    if in_progress:
-        for id in players_eliminated:
-            connection.send(tiles.MessagePlayerEliminated(id).pack())
-
-    while True:
-      chunk = connection.recv(4096)
-
-      # kill this thread if the client disconnects
-      if not chunk:
-        print('client {} disconnected'.format(address))
-        with lock:
-            disconnect_player(connection, idnum)
-        return
-
-      while True:
-          # kill this thread if the client is in a game
-          if in_progress:
-              for item in turn_order:
-                  if item == idnum:
-                      print('closing spectator thread for id: ', idnum)
-                      return
-
-
-
-def client_handler(lock, connection, address, players):
+def client_handler(lock, connection, address):
   host, port = address
   name = '{}:{}'.format(host, port)
 
   idnum = players[connection].id
-
-  global live_idnums
-  global turn_index
-  global placements
-  global current_tokens
-  global TIMEOUT
-
-  live_idnums.append(idnum)
-
-  # let this client know that the game is starting
-  connection.send(tiles.MessageWelcome(idnum).pack())
-  connection.send(tiles.MessageGameStart().pack())
-
-  # let this client know of the other players on the server
-  for key in players:
-      if key is not connection:
-          other_host, other_port = players[key].address
-          other_name = '{}:{}'.format(other_host, other_port)
-          connection.send(tiles.MessagePlayerJoined(other_name, players[key].id).pack())
-
-  # let client know of turns
-  for id in turn_order:
-      connection.send(tiles.MessagePlayerTurn(id).pack())
-
-  # client chooses tiles randomly
-  for _ in range(tiles.HAND_SIZE):
-    tileid = tiles.get_random_tileid()
-    players[connection].hand.append(tileid)
-    connection.send(tiles.MessageAddTileToHand(tileid).pack())
-
-  # let client know of actual current turn
-  connection.send(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
-
-  global board
-  global players_remaining
 
   buffer = bytearray()
 
@@ -202,17 +106,12 @@ def client_handler(lock, connection, address, players):
       # handle client disconnection
       print('client {} disconnected'.format(address))
 
-
       # increment turns if it was that players turn
       if len(players) > 1:
-          if turn_order[turn_index] == idnum:
+          if idnum in turn_order:
               with lock:
-                  send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index+1]).pack(), connection)
                   turn_order.remove(idnum)
-          else:
-              if idnum in turn_order:
-                  with lock:
-                      turn_order.remove(idnum)
+                  send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
 
 
       # run the disconnect client function
@@ -220,11 +119,16 @@ def client_handler(lock, connection, address, players):
           disconnect_player(connection, idnum)
 
           # let other clients know the client has been eliminated, add to players eliminated
-          send_to_others(tiles.MessagePlayerEliminated(idnum).pack(), connection)
-          players_eliminated.append(idnum)
+          if idnum not in players_eliminated:
+              send_to_others(tiles.MessagePlayerEliminated(idnum).pack(), connection)
+              players_eliminated.append(idnum)
+
+      send_to_others(tiles.MessagePlayerLeft(idnum).pack(), connection)
 
       # check if client disconnection should cause came to finish
-      check_game_over(idnum)
+      if check_game_over(connection):
+          pass
+
       return
 
     buffer.extend(chunk)
@@ -243,7 +147,6 @@ def client_handler(lock, connection, address, players):
       # their second)
       if isinstance(msg, tiles.MessagePlaceTile) and idnum == turn_order[turn_index]:
         if board.set_tile(msg.x, msg.y, msg.tileid, msg.rotation, msg.idnum):
-
           # notify client that placement was successful
           send_to_all(msg.pack())
 
@@ -252,7 +155,7 @@ def client_handler(lock, connection, address, players):
           placements.append(tile_msg)
 
           # check for token movement
-          positionupdates, eliminated = board.do_player_movement(live_idnums)
+          positionupdates, eliminated = board.do_player_movement(players_remaining)
 
           for msg in positionupdates:
             send_to_all(msg.pack())
@@ -261,35 +164,38 @@ def client_handler(lock, connection, address, players):
             token_msg = [msg.idnum, msg.x, msg.y, msg.position]
             current_tokens.append(token_msg)
 
+          # check for resulting eliminated players
+          for id in players_remaining:
+              if id in eliminated and id not in players_eliminated:
+                # let all clients know this client has been eliminated
+                send_to_all(tiles.MessagePlayerEliminated(id).pack())
 
-          if idnum in eliminated:
-            # let all clients know this client has been eliminated
-            send_to_all(tiles.MessagePlayerEliminated(idnum).pack())
+                # remove eliminated client from players remaining, add to players eliminated
+                players_remaining.remove(id)
+                players_eliminated.append(id)
 
-            # remove eliminated client from players remaining, add to players eliminated
-            if idnum in players_remaining:
-                players_remaining.remove(idnum)
-            players_eliminated.append(idnum)
+                if id in turn_order:
+                    with lock:
+                        turn_order.remove(id)
 
-            with lock:
-                turn_order.remove(idnum)
+                send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
 
-            send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
-
-            # check to see if client eliminated should cause game to finish
-            check_game_over(idnum)
-            return
+                # check to see if client eliminated should cause game to finish
+                if check_game_over(connection):
+                    break
 
           # pickup a new tile and remove placed tile from hand
-          players[connection].hand.remove(tile_msg[1])
+          if tile_msg[1] in players[connection].hand:
+              players[connection].hand.remove(tile_msg[1])
           tileid = tiles.get_random_tileid()
           players[connection].hand.append(tileid)
           connection.send(tiles.MessageAddTileToHand(tileid).pack())
 
           # start next turn, increment the turn index and send next turn to all clients
-          with lock:
-              turn_order.remove(idnum)
-              turn_order.append(idnum)
+          if idnum in turn_order:
+              with lock:
+                  turn_order.remove(idnum)
+                  turn_order.append(idnum)
           send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
 
       # sent by the player in the second turn, to choose their token's
@@ -297,9 +203,8 @@ def client_handler(lock, connection, address, players):
       elif isinstance(msg, tiles.MessageMoveToken) and idnum == turn_order[turn_index]:
         if not board.have_player_position(msg.idnum):
           if board.set_player_start_position(msg.idnum, msg.x, msg.y, msg.position):
-
             # check for token movement
-            positionupdates, eliminated = board.do_player_movement(live_idnums)
+            positionupdates, eliminated = board.do_player_movement(players_remaining)
 
             for msg in positionupdates:
               send_to_all(msg.pack())
@@ -308,29 +213,31 @@ def client_handler(lock, connection, address, players):
               token_msg = [msg.idnum, msg.x, msg.y, msg.position]
               current_tokens.append(token_msg)
 
-            if idnum in eliminated:
+
+            if idnum in eliminated and idnum not in players_eliminated:
               # let clients know player has been eliminated
               send_to_all(tiles.MessagePlayerEliminated(idnum).pack())
 
               # remove eliminated client from players remaining, add to players eliminated
-              if idnum in players_remaining:
-                  players_remaining.remove(idnum)
+              players_remaining.remove(idnum)
               players_eliminated.append(idnum)
 
-              with lock:
-                  turn_order.remove(idnum)
+              if idnum in turn_order:
+                  with lock:
+                      turn_order.remove(idnum)
 
               send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
 
               # check if this player being eliminated should cause the game to finish
-              check_game_over(idnum)
-              return
+              if check_game_over(connection):
+                  break
 
             # start next turn, increment the turn index and send next turn to all clients
-            with lock:
-                #turn_index = (turn_index + 1) % len(turn_order)
-                turn_order.remove(idnum)
-                turn_order.append(idnum)
+            if idnum in turn_order:
+                with lock:
+                    #turn_index = (turn_index + 1) % len(turn_order)
+                    turn_order.remove(idnum)
+                    turn_order.append(idnum)
             send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
 
 
@@ -355,13 +262,6 @@ class Player():
         self.address = address
         self.id = id
         self.hand = hand
-
-
-# global variables for game
-players = {}
-players_remaining = []
-
-playerno = 0
 
 
 
@@ -425,10 +325,32 @@ def start_game():
     print('starting game...')
     print(turn_order)
 
-    # start a thread to handle each client in game
-    for i in range(len(players)):
-      threading.Thread(target=client_handler, args=(lock, list(players)[i], players[list(players)[i]].address, players,), daemon=True).start()
+    ##------------------------------------------------------------##
+    # Client communication:
 
+    # let the clients know that the game is starting
+    for key in players:
+        key.send(tiles.MessageWelcome(players[key].id).pack())
+
+    send_to_all(tiles.MessageGameStart().pack())
+
+    # let clients know of turn order
+    for id in turn_order:
+        send_to_all(tiles.MessagePlayerTurn(id).pack())
+
+    # let clients know of actual current turn
+    send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
+
+    # send hand to each client
+    for key in players:
+        if players[key].id in players_remaining:
+            # client chooses tiles randomly
+            for _ in range(tiles.HAND_SIZE):
+              tileid = tiles.get_random_tileid()
+              players[key].hand.append(tileid)
+              key.send(tiles.MessageAddTileToHand(tileid).pack())
+
+    ##------------------------------------------------------------##
 
 
 
@@ -444,11 +366,43 @@ while True:
 
 
   # start thread for the client to spectate
-  threading.Thread(target=client_spec, args=(lock, connection, client_address, players), daemon=True).start()
+  threading.Thread(target=client_handler, args=(lock, connection, client_address), daemon=True).start()
 
   playerno += 1
 
   print('received connection from {}'.format(client_address))
+
+  # let the client know of the other players on the server
+  for key in players:
+      if key is not connection:
+          other_host, other_port = players[key].address
+          other_name = '{}:{}'.format(other_host, other_port)
+          connection.send(tiles.MessagePlayerJoined(other_name, players[key].id).pack())
+
+  # let the existing clients know of this client joining the server
+  host, port = client_address
+  name = '{}:{}'.format(host, port)
+  send_to_others(tiles.MessagePlayerJoined(name, players[connection].id).pack(), connection)
+
+
+  # let the client know of the current state of the game if a game is in progress
+  if in_progress:
+      for t in range(len(placements)):
+          place = tiles.MessagePlaceTile(placements[t][0], placements[t][1], placements[t][2], placements[t][3], placements[t][4])
+          connection.send(place.pack())
+
+      for a in range(len(current_tokens)):
+          tok = tiles.MessageMoveToken(current_tokens[a][0], current_tokens[a][1],current_tokens[a][2],current_tokens[a][3])
+          connection.send(tok.pack())
+
+      for id in players_eliminated:
+          connection.send(tiles.MessagePlayerEliminated(id).pack())
+
+      for id in turn_order:
+          connection.send(tiles.MessagePlayerTurn(id).pack())
+
+      connection.send(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
+
 
   # start the game if enough players are spectating and a game is not in progress
   if (len(players) >= 2) and not in_progress:
