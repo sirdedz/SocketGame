@@ -20,10 +20,13 @@ import sys
 import tiles
 import threading
 import random
+import signal
 
 # countdown time in seconds before a game starts
 countdown = 0
 
+# time each player has to make a move
+timeout = 10
 
 
 # global variables used for game
@@ -73,6 +76,7 @@ def check_game_over(con):
 
     if len(players_remaining) == 1 and len(players) >= 2:
         #Game has finished, new game needed
+        signal.alarm(0)
         print('Game Over, starting new game...')
         in_progress = True
         turn_order.clear()
@@ -81,6 +85,7 @@ def check_game_over(con):
         return True
 
     elif len(players_remaining) == 1:
+        signal.alarm(0)
         print('Game over')
         turn_order.clear()
         placements.clear()
@@ -88,6 +93,223 @@ def check_game_over(con):
         return True
 
     return False
+
+
+
+
+
+def tile_place(msg, con, idnum):
+    if board.set_tile(msg.x, msg.y, msg.tileid, msg.rotation, msg.idnum):
+        send_to_all(msg.pack())
+
+        # add tile place to placement history
+        tile_msg = [msg.idnum, msg.tileid, msg.rotation, msg.x, msg.y]
+        placements.append(tile_msg)
+
+        # check for token movement
+        positionupdates, eliminated = board.do_player_movement(players_remaining)
+
+        # pickup a new tile and remove placed tile from hand
+        players[con].hand.remove(msg.tileid)
+        new_tileid = tiles.get_random_tileid()
+        players[con].hand.append(new_tileid)
+        con.send(tiles.MessageAddTileToHand(new_tileid).pack())
+
+        for msg in positionupdates:
+          send_to_all(msg.pack())
+
+          # record up to date position of token
+          token_msg = [msg.idnum, msg.x, msg.y, msg.position]
+          current_tokens.append(token_msg)
+
+        # check for resulting eliminated players
+        for id in players_remaining:
+            if id in eliminated and id not in players_eliminated:
+              # let all clients know this client has been eliminated
+              send_to_all(tiles.MessagePlayerEliminated(id).pack())
+
+              # remove eliminated client from players remaining, add to players eliminated
+              players_remaining.remove(id)
+              players_eliminated.append(id)
+
+              if id in turn_order:
+                  with lock:
+                      turn_order.remove(id)
+
+              send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), con)
+              signal.alarm(timeout)
+
+              # check to see if client eliminated should cause game to finish
+              if check_game_over(con):
+                  break
+
+        # start next turn, increment the turn index and send next turn to all clients
+        if idnum in turn_order:
+            with lock:
+                turn_order.remove(idnum)
+                turn_order.append(idnum)
+
+        send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
+        signal.alarm(timeout)
+
+
+
+def token_place(msg, connection, idnum):
+    if not board.have_player_position(msg.idnum):
+      if board.set_player_start_position(msg.idnum, msg.x, msg.y, msg.position):
+        signal.alarm(0)
+        # check for token movement
+        positionupdates, eliminated = board.do_player_movement(players_remaining)
+
+        for msg in positionupdates:
+          send_to_all(msg.pack())
+
+          # record up to date position of token
+          token_msg = [msg.idnum, msg.x, msg.y, msg.position]
+          current_tokens.append(token_msg)
+
+
+        if idnum in eliminated and idnum not in players_eliminated:
+          # let clients know player has been eliminated
+          send_to_all(tiles.MessagePlayerEliminated(idnum).pack())
+
+          # remove eliminated client from players remaining, add to players eliminated
+          players_remaining.remove(idnum)
+          players_eliminated.append(idnum)
+
+          if idnum in turn_order:
+              with lock:
+                  turn_order.remove(idnum)
+
+
+          # check if this player being eliminated should cause the game to finish
+          if check_game_over(connection):
+              return
+
+        # start next turn, increment the turn index and send next turn to all clients
+        if idnum in turn_order:
+            with lock:
+                #turn_index = (turn_index + 1) % len(turn_order)
+                turn_order.remove(idnum)
+                turn_order.append(idnum)
+        send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
+        signal.alarm(timeout)
+
+
+
+
+
+def choose_turn():
+    positions = [
+        [0, 0], [0, 1], [0, 2], [0,3], [0, 4],
+        [1, 0], [1, 1], [1, 2], [1,3], [1, 4],
+        [2, 0], [2, 1], [2, 2], [2,3], [2, 4],
+        [3, 0], [3, 1], [3, 2], [3,3], [3, 4],
+        [4, 0], [4, 1], [4, 2], [4,3], [4, 4]
+    ]
+
+    border_positions = [
+        [0, 0], [0, 1], [0, 2], [0,3], [0, 4],
+        [1, 0], [1, 4],
+        [2, 0], [2, 4],
+        [3, 0], [3, 4],
+        [4, 0], [4, 1], [4, 2], [4,3], [4, 4]
+    ]
+
+    global con
+
+    #get player details
+    for key in players:
+        if players[key].id == turn_order[turn_index]:
+            con = key
+
+
+
+    # get positions already taken
+    i = 0
+    for p in board.tileids:
+        if p is not None:
+            if positions[i] in border_positions:
+                border_positions.remove(positions[i])
+        i += 1
+
+
+    if len(placements) < len(players_remaining):
+        # must place first tile on border
+
+        # get random tile position
+        x, y = random.choice(border_positions)
+        idnum = turn_order[turn_index]
+        tileid = random.choice(players[con].hand)
+        rot = random.randrange(4)
+
+        msg = tiles.MessagePlaceTile(idnum, tileid, rot, x, y)
+        tile_place(msg, con, idnum)
+
+    elif len(current_tokens) < len(players_remaining):
+        # must choose token position
+        # get tile position
+
+        idnum = turn_order[turn_index]
+
+        for p in placements:
+            if p[0] == idnum:
+                x = p[3]
+                y = p[4]
+
+        if x == 0 and y == 0:
+            pos = random.choice([4, 5, 6, 7])
+        elif x == 0 and y == tiles.BOARD_HEIGHT-1:
+            pos = random.choice([6, 7, 0, 1])
+        elif y == tiles.BOARD_HEIGHT-1 and x == tiles.BOARD_WIDTH-1:
+            pos = random.choice([0, 1, 2, 3])
+        elif x == tiles.BOARD_WIDTH-1 and y == 0:
+            pos = random.choice([2, 3, 4, 5])
+        elif x == 0:
+            pos = random.choice([6, 7])
+        elif x == tiles.BOARD_WIDTH-1:
+            pos = random.choice([2, 3])
+        elif y == 0:
+            pos = random.choice([4, 5])
+        elif y == tiles.BOARD_HEIGHT-1:
+            pos = random.choice([0, 1])
+
+        #top right = pos 4
+        #top left = pos 5
+        #right top = 3
+        #right bottom = 2
+        #left top = 6
+        #left bottom = 7
+        #bottom left = 0
+        #bottom right = 1
+
+        msg = tiles.MessageMoveToken(idnum, x, y, pos)
+        token_place(msg, con, idnum)
+    else:
+        #normal tile place
+        # get token position
+        idnum = turn_order[turn_index]
+        x, y, pos = board.get_player_position(idnum)
+        tileid = random.choice(players[con].hand)
+        rot = random.randrange(4)
+
+        msg = tiles.MessagePlaceTile(idnum, tileid, rot, x, y)
+        tile_place(msg, con, idnum)
+
+
+
+def timeout_player(signum, frame):
+    print('player took to long making turn, server making turn for them...')
+    signal.alarm(0)
+    # choose player turn
+    choose_turn()
+
+    signal.alarm(timeout)
+
+
+signal.signal(signal.SIGALRM, timeout_player)
+
+
 
 
 
@@ -112,7 +334,7 @@ def client_handler(lock, connection, address):
               with lock:
                   turn_order.remove(idnum)
                   send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
-
+                  signal.alarm(timeout)
 
       # run the disconnect client function
       with lock:
@@ -145,100 +367,13 @@ def client_handler(lock, connection, address):
 
       # sent by the player to put a tile onto the board (in all turns except
       # their second)
-      if isinstance(msg, tiles.MessagePlaceTile) and idnum == turn_order[turn_index]:
-        if board.set_tile(msg.x, msg.y, msg.tileid, msg.rotation, msg.idnum):
-          # notify client that placement was successful
-          send_to_all(msg.pack())
-
-          # add tile place to placement history
-          tile_msg = [msg.idnum, msg.tileid, msg.rotation, msg.x, msg.y]
-          placements.append(tile_msg)
-
-          # check for token movement
-          positionupdates, eliminated = board.do_player_movement(players_remaining)
-
-          for msg in positionupdates:
-            send_to_all(msg.pack())
-
-            # record up to date position of token
-            token_msg = [msg.idnum, msg.x, msg.y, msg.position]
-            current_tokens.append(token_msg)
-
-          # check for resulting eliminated players
-          for id in players_remaining:
-              if id in eliminated and id not in players_eliminated:
-                # let all clients know this client has been eliminated
-                send_to_all(tiles.MessagePlayerEliminated(id).pack())
-
-                # remove eliminated client from players remaining, add to players eliminated
-                players_remaining.remove(id)
-                players_eliminated.append(id)
-
-                if id in turn_order:
-                    with lock:
-                        turn_order.remove(id)
-
-                send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
-
-                # check to see if client eliminated should cause game to finish
-                if check_game_over(connection):
-                    break
-
-          # pickup a new tile and remove placed tile from hand
-          if tile_msg[1] in players[connection].hand:
-              players[connection].hand.remove(tile_msg[1])
-          tileid = tiles.get_random_tileid()
-          players[connection].hand.append(tileid)
-          connection.send(tiles.MessageAddTileToHand(tileid).pack())
-
-          # start next turn, increment the turn index and send next turn to all clients
-          if idnum in turn_order:
-              with lock:
-                  turn_order.remove(idnum)
-                  turn_order.append(idnum)
-          send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
+      if isinstance(msg, tiles.MessagePlaceTile) and in_progress and idnum == turn_order[turn_index]:
+        tile_place(msg, connection, idnum)
 
       # sent by the player in the second turn, to choose their token's
       # starting path
-      elif isinstance(msg, tiles.MessageMoveToken) and idnum == turn_order[turn_index]:
-        if not board.have_player_position(msg.idnum):
-          if board.set_player_start_position(msg.idnum, msg.x, msg.y, msg.position):
-            # check for token movement
-            positionupdates, eliminated = board.do_player_movement(players_remaining)
-
-            for msg in positionupdates:
-              send_to_all(msg.pack())
-
-              # record up to date position of token
-              token_msg = [msg.idnum, msg.x, msg.y, msg.position]
-              current_tokens.append(token_msg)
-
-
-            if idnum in eliminated and idnum not in players_eliminated:
-              # let clients know player has been eliminated
-              send_to_all(tiles.MessagePlayerEliminated(idnum).pack())
-
-              # remove eliminated client from players remaining, add to players eliminated
-              players_remaining.remove(idnum)
-              players_eliminated.append(idnum)
-
-              if idnum in turn_order:
-                  with lock:
-                      turn_order.remove(idnum)
-
-              send_to_others(tiles.MessagePlayerTurn(turn_order[turn_index]).pack(), connection)
-
-              # check if this player being eliminated should cause the game to finish
-              if check_game_over(connection):
-                  break
-
-            # start next turn, increment the turn index and send next turn to all clients
-            if idnum in turn_order:
-                with lock:
-                    #turn_index = (turn_index + 1) % len(turn_order)
-                    turn_order.remove(idnum)
-                    turn_order.append(idnum)
-            send_to_all(tiles.MessagePlayerTurn(turn_order[turn_index]).pack())
+      elif isinstance(msg, tiles.MessageMoveToken) and in_progress and idnum == turn_order[turn_index]:
+        token_place(msg, connection, idnum)
 
 
 
@@ -254,6 +389,9 @@ sock.setblocking(True)
 print('listening on {}'.format(sock.getsockname()))
 
 sock.listen(5)
+
+
+
 
 
 # class to consolidate a clients id and address
